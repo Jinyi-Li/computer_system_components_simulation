@@ -20,7 +20,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "mm.h"
+#include "malloc_simulator.h"
 #include "memlib.h"
 
 // #define DEBUG
@@ -483,7 +483,6 @@ static void add_to_list(block_t *new)
 }
 
 /****************** STATIC HELPER METHODS ************************************/
-
 /************ LIST OPERATIONS ************/
 
 /*
@@ -503,7 +502,6 @@ static block_t *get_prev_free(block_t *curr)
 }
 
 /************ HEAP OPERATIONS ************/
-
 /*
  * Get the block physically next to the curr block.
  */
@@ -526,7 +524,6 @@ static block_t *get_prev_block(block_t *curr)
 }
 
 /************ BLOCK OPERATIONS ************/
-
 /*
  * Return the payload pointer with the given block pointer.
  */
@@ -604,7 +601,6 @@ static void write_block(block_t *block, size_t size, bool is_allocated)
 }
 
 /************ LOW_LEVEL/MATH OPERATIONS ************/
-
 /*
  * Pack bits of allocation flag and a block size.
  * Return the packed word_t value.
