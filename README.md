@@ -10,4 +10,7 @@ Simulate the cache behaviors on Load and Store requests, and count the numbers o
 
 mm.c - 
 
-Simulate the behaviors of linux methods malloc, calloc, realloc and free.
+Simulate the behaviors of linux methods malloc, calloc, realloc and free. It supports a full 64-bit address space, with a trade-off of correctness, space utilization and throughput. The experiment environment was Intel(R)Xeon(R)CPUE5520@2.27GHz, Intel Xeon, E5520, 2.27GHz. The performance was measured by both memory and CPU cycles. The benchmark results were provided by the embeded linux methods in the experiment environment.
+
+
+
