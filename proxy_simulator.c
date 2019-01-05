@@ -1,7 +1,25 @@
+/*
+ * proxy.c
+ *
+ * Proxy handles requests from clients.
+ *
+ * If the request has been cached down in the proxy's memory, it'll return
+ * the cached web object content without querying the real server.
+ *
+ * It the request's not been cached yet, the proxy will send the request to
+ * the real server, after making necessary changes to the headers. After
+ * getting response, the response will go to the client.
+ *
+ * Meanwhile, if the response object is small enough to be held in cache,
+ * it'll be cached.
+ *
+ * Author: Jinyi Li
+ */
 #include "csapp.h"
+#include "cache.h"
 #include <stdbool.h>
 
-#define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 /* When debugging is enabled, the underlying functions get called */
@@ -11,6 +29,8 @@
 #define dbg_printf(...)
 #endif
 
+/* Max web object size */
+#define MAX_OBJECT_SIZE (100*1024)
 /* Max text line length */
 #define MAXLINE 8192
 /* Length of host address */
@@ -35,6 +55,8 @@ static const char *header_user_agent = "User-Agent: Mozilla/5.0"
 static const char *header_connection = "Connection: close\r\n";
 /* Proxy connection header string. */
 static const char *header_proxy_connection = "Proxy-Connection: close\r\n";
+/* Semaphore that protects the shared cache. */
+sem_t mutex;
 
 
 /*
@@ -44,8 +66,8 @@ static const char *header_proxy_connection = "Proxy-Connection: close\r\n";
  * It will return 0 if succeeds, or 1 if fails.
  */
 int process_request(char *buf, char *socket_address, char *host, char *port,
-                    char *method, char *resource) {
-    char uri[MAXLINE], version;
+                    char *uri, char *method, char *resource) {
+    char version;
 
     // Parse request into: method, URI, version.
     if (sscanf(buf, "%s %s HTTP/1.%c", method, uri, &version) != 3
@@ -126,7 +148,6 @@ int process_headers(rio_t rio, int proxyfd, char *socket_address, char *buf) {
     } while (strncmp(buf, "\r\n", sizeof("\r\n")));
 
     // Add some headers if not exists in the original request.
-    has_connection = false;
     if (!has_host) {
         strcpy(buf, "Host: ");
         strcpy(buf, socket_address);
@@ -156,24 +177,120 @@ int process_headers(rio_t rio, int proxyfd, char *socket_address, char *buf) {
 }
 
 /*
+ * Append content in buf to 'entry_obj' with a current length of obj_len.
+ *
+ * Return 0 if succeeds, or 1 if fails.
+ */
+int append_to_cache_obj(char *entry_obj, int *obj_len, int size, char *buf) {
+    if ((*obj_len + size) > MAX_OBJECT_SIZE) {
+        return 1;
+    }
+    // Update pointer position where I should continue writing.
+    void *write_pos = (void *) (entry_obj + *obj_len);
+    memcpy(write_pos, buf, size);
+    // Update current response object size.
+    *obj_len += size;
+    return 0;
+}
+
+/*
  * Process response from server line by line.
  *
  * Return 0 if succeeds, or 1 if fails.
  */
-int process_response(rio_t pxyrio, int pxyfd, int clientfd, char *pxybuf) {
+int process_response(rio_t pxyrio, int pxyfd, int clientfd, char *pxybuf,
+                     char *entry_obj, int *obj_len) {
     // Initialize reading from proxy-server socket.
     Rio_readinitb(&pxyrio, pxyfd);
-    dbg_printf("Response: \n");
     ssize_t size;
 
     // Read from server, write to client.
+    bool is_valid_obj = true;
     while ((size = rio_readlineb(&pxyrio, pxybuf, MAXLINE)) > 0) {
         if ((size_t) rio_writen(clientfd, pxybuf, size) != size) {
             return 1;
         }
-        dbg_printf("%s", pxybuf);
+
+        // Write to cache object.
+        if (is_valid_obj) {
+            if (append_to_cache_obj(entry_obj, obj_len, size, pxybuf)) {
+                is_valid_obj = false;
+            }
+        }
     }
-    return 0;
+    // If failed rio_writen or invalid cache obj, all need to return 1
+    // to free all malloc-ed resource and close the proxy-client socket.
+    return is_valid_obj ? 0 : 1;
+}
+
+/*
+ * Free malloc-ed resource and close proxy-client socket.
+ */
+void free_resource(char *url, char *obj, int proxyfd) {
+    Free(url);
+    Free(obj);
+    Close(proxyfd);
+}
+
+/*
+ * When no cached data, serve this request to the corresponding server.
+ */
+void serve_request(char *host, char *port, char *uri, char *socket_address,
+                   char *buf, rio_t rio, int connfd) {
+    int proxyfd;
+
+    // Initialize for cache entry's url and response object.
+    char *entry_url = Malloc(sizeof(char) * (strlen(uri) + 1));
+    strcpy(entry_url, uri);
+    char *entry_obj = Malloc(MAX_OBJECT_SIZE);
+    int obj_len = 0;
+
+    // Open a proxy-server connection.
+    if ((proxyfd = open_clientfd(host, port)) < 0) {
+        Free(entry_url);
+        Free(entry_obj);
+        return;
+    }
+    // Send request.
+    if ((size_t) rio_writen(proxyfd, buf, strlen(buf)) != strlen(buf)) {
+        free_resource(entry_url, entry_obj, proxyfd);
+        return;
+    }
+    // Send headers.
+    if (process_headers(rio, proxyfd, socket_address, buf)) {
+        free_resource(entry_url, entry_obj, proxyfd);
+        return;
+    }
+    // Send response: read from server, write to client.
+    rio_t pxyrio;
+    char pxybuf[MAXLINE];
+    int response_res = process_response(pxyrio, proxyfd, connfd, pxybuf,
+                                        entry_obj, &obj_len);
+    if (response_res == 1) {
+        free_resource(entry_url, entry_obj, proxyfd);
+        return;
+    } else {
+        // Save the valid-size response object to cache.
+        entry *new_entry = create_entry(entry_url, entry_obj, obj_len);
+
+        // Add lock to protect the cache.
+        P(&mutex);
+        put_new_entry(new_entry);
+        V(&mutex);
+
+        Close(proxyfd);
+    }
+}
+
+/*
+ * When having cached data, serve the client with cached entry.
+ */
+void serve_cache(entry *cache_entry, int connfd, char *buf, rio_t rio) {
+    // Send response: read from server, write to client.
+    if ((size_t) rio_writen(connfd, cache_entry->response,
+                            cache_entry->obj_len) != cache_entry->obj_len) {
+        return;
+    }
 }
 
 /*
@@ -181,61 +298,43 @@ int process_response(rio_t pxyrio, int pxyfd, int clientfd, char *pxybuf) {
  *
  * If error occurs during reading or writing, the function will return.
  */
-void serve(client_info *client) {
-    int proxyfd;
+void serve(int connfd) {
     char buf[MAXLINE], socket_address[MAXLINE], host[MAXLINE], port[MAXLINE],
-            method[MAXLINE],
-            resource[MAXLINE];
-
-    // Get some extra info about the client (hostname/port)
-    Getnameinfo((SA * ) & client->addr, client->addrlen,
-                client->host, sizeof(client->host),
-                client->serv, sizeof(client->serv),
-                0);
-    dbg_printf("Accepted connection from %s:%s\n", client->host, client->serv);
+            uri[MAXLINE], method[MAXLINE], resource[MAXLINE];
 
     // Initialize client-proxy file descriptor.
     rio_t rio;
-    Rio_readinitb(&rio, client->connfd);
+    Rio_readinitb(&rio, connfd);
 
-    // Process request: step 1, read from client, validate.
+    // Process request line.
     ssize_t rc;
     if ((rc = rio_readlineb(&rio, buf, MAXLINE)) < 0) {
         return;
     }
-    if (process_request(buf, socket_address, host, port, method, resource)) {
+    dbg_printf("Request: %s\n", buf);
+    if (process_request(buf, socket_address, host,
+                        port, uri, method, resource)) {
         return;
     }
 
-    // Open a proxy-server connection.
-    dbg_printf("***host: %s port: %s\n", host, port);
-    if ((proxyfd = open_clientfd(host, port)) < 0) {
-        return;
+    entry *cache_entry = read_entry(uri);
+    if (cache_entry) {                          // Serve cached response
+        serve_cache(cache_entry, connfd, buf, rio);
+    } else {                                    // Serve requested response.
+        serve_request(host, port, uri, socket_address, buf, rio, connfd);
     }
+}
 
-    // Process request: step 2, write to server.
-    if ((size_t) rio_writen(proxyfd, buf, strlen(buf)) != strlen(buf)) {
-        return;
-    }
-    dbg_printf("%s", buf);
-
-    // Process headers: read from client, write to server.
-    if (process_headers(rio, proxyfd, socket_address, buf)) {
-        return;
-    }
-
-    // Process response: read from server, write to client.
-    rio_t pxyrio;
-    char pxybuf[MAXLINE];
-    if (process_response(pxyrio, proxyfd, client->connfd, pxybuf)) {
-        return;
-    }
-
-    // Close proxy-server socket.
-    int close_rc;
-    if ((close_rc = close(proxyfd)) < 0) {
-        return;
-    }
+/*
+ * A thread handler to detach, serve, and free the thread to process a request.
+ */
+void *thread(void *thread_arg) {
+    pthread_detach(pthread_self());
+    int connfd = *((int *) thread_arg);
+    Free(thread_arg);
+    serve(connfd);
+    Close(connfd);
+    return NULL;
 }
 
 
@@ -247,7 +346,10 @@ int main(int argc, char **argv) {
     Sigaddset(&mask, SIGPIPE);
     Sigprocmask(SIG_BLOCK, &mask, &prev);
 
-    int listenfd;
+    int listenfd, *connfdp;
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
+    pthread_t tid;
 
     // Get port number from the command line argument.
     if (argc != 2) {
@@ -256,26 +358,24 @@ int main(int argc, char **argv) {
     }
 
     // Create server socket - listen to port and accept client sockets.
-    char *clientport = argv[1];
-    listenfd = Open_listenfd(clientport);
+    char *proxyport = argv[1];
+
+    // Initiate the cache.
+    init_cache();
+    // Initiate the Semaphore.
+    Sem_init(&mutex, 0, 1);
+
+    listenfd = Open_listenfd(proxyport);
     while (1) {
         // Save client info on stack.
-        client_info client_data;
-        client_info *client = &client_data;
+        clientlen = sizeof(struct sockaddr_storage);
+        connfdp = malloc(sizeof(int));
+        if (!connfdp) {
+            continue;
+        }
+        *connfdp = Accept(listenfd, (SA * ) & clientaddr, &clientlen);
 
-        // Initialize client address.
-        client->addrlen = sizeof(client->addr);
-
-        // Get accepted client socket's file descriptor.
-        client->connfd = Accept(listenfd,
-                                (SA * ) & client->addr, &client->addrlen);
-
-        // Connect with a client and serve.
-        serve(client);
-
-        // Close connection and release the port for new requests to come.
-        Close(client->connfd);
+        // Create a thread to handle this request.
+        Pthread_create(&tid, NULL, thread, connfdp);
     }
-    // Never reach here.
-    Sigprocmask(SIG_SETMASK, &prev, NULL);
 }
