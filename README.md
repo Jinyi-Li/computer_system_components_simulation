@@ -16,3 +16,8 @@ Simulate the behaviors of linux methods malloc, calloc, realloc and free. It sup
 shell_simulator.c -
 
 Simulate the behaviors of linux shell. It supports a simple form of job control and I/O redirection. For non-builtin commands, it runs the corresponding executable if exists. It also handles SIGCHLD, SIGINT, and SIGTSTP signals.
+
+
+proxy_simulator.c - 
+
+Simulate the behaviors of a cache web proxy server. It creates a proxy that accepts incoming connections, reads and parses requests, forwards requests to web servers, reads the servers’ responses, and forwards the responses to the corresponding clients. It uses basic HTTP operations and socket programming.
